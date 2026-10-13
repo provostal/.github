@@ -201,7 +201,22 @@ model keys, and a tag can be moved by anyone who can push here. A pinned SHA
 means a change here reaches a repository only when its stub is changed, which is
 under `.github/workflows/` and so beyond the coding app's reach. Dependabot's
 `github-actions` ecosystem can keep such pins current from the tags, once the
-caller enables it in its `.github/dependabot.yml`.
+caller enables it in its `.github/dependabot.yml`:
+
+```yaml
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directories:
+      - /
+      - /.github/actions/*   # the setup action
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+```
 
 The actions this workflow uses itself (`anthropics/claude-code-action`,
 `openai/codex-action`, `actions/create-github-app-token` and the rest) are pinned

@@ -227,7 +227,7 @@ jobs:
           git add -A
           git diff --cached --binary "${START}" > "${RUNNER_TEMP}/changes.patch"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: provostal-coding-changes
           path: ${{ runner.temp }}/changes.patch
@@ -266,7 +266,7 @@ jobs:
           token: ${{ steps.app-token.outputs.token }}
           persist-credentials: false
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: provostal-coding-changes
           path: ${{ runner.temp }}/changes

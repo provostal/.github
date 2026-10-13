@@ -64,7 +64,8 @@ jobs:
     concurrency:
       group: provostal-coding-${{ inputs.branch }}
       cancel-in-progress: false
-    uses: provostal/.github/.github/workflows/coding-run.yml@v1
+    # A full commit SHA, see Versions below.
+    uses: provostal/.github/.github/workflows/coding-run.yml@<sha> # v1.1.0
     with:
       work_item: ${{ inputs.work_item }}
       title: ${{ inputs.title }}
@@ -126,9 +127,12 @@ runs:
         npm run build
 ```
 
-`setup_token` reaches the action's steps as the environment variable
-`SETUP_TOKEN`, for one credential the setup itself needs (reading another
-repository, for instance). It is not available to the agent's step.
+`setup_token` reaches the action as the environment variable `SETUP_TOKEN`, for
+one credential the setup itself needs (reading another repository, for
+instance). It is not available to the agent's step, but it is to **every** step
+of the action, including the ones that run the branch's code (`composer
+install`, `npm ci`, a build). Blank it on those with `env: { SETUP_TOKEN: "" }`
+and leave it only on the step that needs it.
 
 ### Engine
 
@@ -168,8 +172,9 @@ Makefile target, a script), sits outside `.github/workflows/`. A run can change
 it on its branch, and the next run on that branch executes the changed version
 before its agent starts, with `SETUP_TOKEN` in its environment. Give
 `setup_token` only a read-only credential, scoped as narrowly as the setup
-allows, and keep the setup from writing it anywhere the agent can read later:
-not to disk, not to `$GITHUB_ENV`.
+allows, blank it on every setup step that does not need it, and keep the setup
+from writing it anywhere the agent can read later: not to disk, not to
+`$GITHUB_ENV`.
 
 Nor is the repository's own CI. The pull request is pushed with the app's token
 precisely so that CI runs on it, and CI then runs the agent's code: its tests,
@@ -180,11 +185,29 @@ a secret; a secret belongs only in a step that runs nothing from the branch
 
 ## Versions
 
-Callers pin a major tag, `@v1`. The tag moves along with changes that keep the
-inputs and secrets above working; anything that breaks a caller is a new major.
-The dispatch inputs follow Provostal's `StartCodingRun`: when that contract
-changes, this workflow gets a new major and the stubs move to it with the
-installations' release.
+Releases are tagged `v<major>.<minor>.<patch>`; `v1` follows the latest `v1.x.y`.
+A minor or patch keeps the inputs and secrets above working; anything that breaks
+a caller is a new major. The dispatch inputs follow Provostal's `StartCodingRun`:
+when that contract changes, this workflow gets a new major.
+
+**Callers pin a full commit SHA**, with the tag as a comment:
+
+```yaml
+uses: provostal/.github/.github/workflows/coding-run.yml@<40-character sha> # v1.1.0
+```
+
+Not `@v1`: the stub hands this workflow the GitHub App's private key and the
+model keys, and a tag can be moved by anyone who can push here. A pinned SHA
+means a change here reaches a repository only when its stub is changed, which is
+under `.github/workflows/` and so beyond the coding app's reach. Dependabot's
+`github-actions` ecosystem can keep such pins current from the tags, once the
+caller enables it in its `.github/dependabot.yml`.
+
+The actions this workflow uses itself (`anthropics/claude-code-action`,
+`openai/codex-action`, `actions/create-github-app-token` and the rest) are pinned
+by major tag, as across the rest of the organisation's workflows. That trusts
+their publishers with the same keys; pinning them by SHA as well is the next
+step if that trust is not enough.
 
 ## Development
 

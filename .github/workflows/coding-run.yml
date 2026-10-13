@@ -1,0 +1,304 @@
+name: Provostal coding run
+
+# Reusable. Provostal's coding agent (StartCodingRun in provostal/provostal)
+# dispatches a small stub workflow in the work item's repository; the stub calls
+# this. Claude Code (or Codex, see `engine`) implements the brief there, with
+# that repository's own CLAUDE.md and checks; the second job opens the pull
+# request, which the repository's CI checks and Provostal hands to its QA agent.
+# Nothing here merges: the repository's default branch is protected, so a
+# person decides.
+#
+# This repository is public so that repositories in other organisations can
+# call it. Nothing secret belongs in it: every secret arrives from the caller.
+# How to call it, and why the work is split over two jobs, is in README.md.
+
+on:
+  workflow_call:
+    inputs:
+      # The five inputs StartCodingRun dispatches the stub with, passed on as is.
+      work_item:
+        description: Work item identifier, e.g. WI-12
+        required: true
+        type: string
+      title:
+        description: Work item title
+        required: true
+        type: string
+      branch:
+        description: The branch to work on
+        required: true
+        type: string
+      base_branch:
+        description: The branch the pull request targets
+        required: true
+        type: string
+      instructions:
+        description: The coding agent's brief
+        required: true
+        type: string
+
+      # What the calling repository sets in its stub.
+      checks:
+        description: >-
+          The commands the agent runs until they pass, one per line, as CLAUDE.md
+          names them. They are also the only commands Claude Code may run.
+        required: true
+        type: string
+      notes:
+        description: Repository-specific instructions added to the prompt
+        required: false
+        type: string
+        default: ""
+      engine:
+        description: "`claude` (also when empty) or `codex`"
+        required: false
+        type: string
+        default: claude
+      app_id:
+        description: The id of the GitHub App whose token pushes and opens the pull request
+        required: true
+        type: string
+    secrets:
+      app_private_key:
+        description: The private key of that GitHub App
+        required: true
+      anthropic_api_key:
+        description: Needed when the engine is claude
+        required: false
+      openai_api_key:
+        description: Needed when the engine is codex
+        required: false
+      setup_token:
+        description: Handed to the repository's setup action as SETUP_TOKEN, before the agent starts
+        required: false
+
+permissions:
+  contents: read
+
+# One run per branch at a time is the stub's concurrency group, on the job that
+# calls this: it covers both jobs below, where a group per job would let a
+# second dispatch slip in between them.
+
+jobs:
+  # Everything the agent touches happens here, with nothing that can write to
+  # GitHub: the checkout and the agent get the workflow's read-only token. The
+  # agent can run any code it writes into the checks, and that code can leave
+  # things behind on this runner — git hooks and config, $GITHUB_ENV, $PATH —
+  # so its only way out is the patch.
+  code:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      start: ${{ steps.start.outputs.sha }}
+
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Remember where the run started
+        id: start
+        run: echo "sha=$(git rev-parse HEAD)" >> "${GITHUB_OUTPUT}"
+
+      # The repository's own toolchain: whatever its checks need to run, as its
+      # CI installs it. A local action resolves against the checkout above, so
+      # this is the calling repository's file, at the branch being worked on.
+      - name: Set up the repository's toolchain
+        if: hashFiles('.github/actions/provostal-coding-setup/action.yml') != ''
+        uses: ./.github/actions/provostal-coding-setup
+        env:
+          SETUP_TOKEN: ${{ secrets.setup_token }}
+
+      # One list feeds both the prompt and Claude Code's --allowedTools. The
+      # list is the stub's, which a run cannot change: the app holds no
+      # Workflows permission.
+      - name: Derive what the agent may run
+        id: checks
+        env:
+          CHECKS: ${{ inputs.checks }}
+        run: |
+          tools="Read,Edit,MultiEdit,Write,Glob,Grep"
+          list=""
+          while IFS= read -r cmd; do
+            cmd="$(printf '%s' "${cmd}" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -n "${cmd}" ] || continue
+            case "${cmd}" in
+              *,* | *\"*)
+                echo "::error::A check may contain neither a comma nor a double quote: ${cmd}"
+                exit 1
+                ;;
+            esac
+            tools="${tools},Bash(${cmd}:*)"
+            list="${list}- ${cmd}"$'\n'
+          done <<< "${CHECKS}"
+          if [ -z "${list}" ]; then
+            echo "::error::The checks input names no command."
+            exit 1
+          fi
+          tools="${tools},Bash(git status:*),Bash(git diff:*),Bash(git log:*)"
+          echo "allowed_tools=${tools}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "list<<PROVOSTAL_CHECKS"
+            printf '%s' "${list}"
+            echo "PROVOSTAL_CHECKS"
+          } >> "${GITHUB_OUTPUT}"
+
+      - uses: anthropics/claude-code-action@v1
+        if: inputs.engine != 'codex'
+        with:
+          anthropic_api_key: ${{ secrets.anthropic_api_key }}
+          # The workflow's own read-only token: the agent needs no write access
+          # to GitHub — committing, pushing and the pull request are the second
+          # job's — and the action stores whatever token it is given in the
+          # checkout's git config.
+          github_token: ${{ github.token }}
+          # Reading and editing files, exactly the repository's checks, and
+          # reading git state. The file tools must be listed too: in a run they
+          # are not granted by default. Note what the list cannot bound: an
+          # agent that may edit files and run the checks can run any code it
+          # writes into them. What keeps that contained is what is in reach —
+          # a read-only GitHub token and no write token on this runner at all —
+          # not the list. Verify against the action's README when upgrading it.
+          claude_args: >-
+            --max-turns 80
+            --allowedTools "${{ steps.checks.outputs.allowed_tools }}"
+          prompt: |
+            You are implementing work item ${{ inputs.work_item }} ("${{ inputs.title }}")
+            on branch ${{ inputs.branch }} of this repository. Read CLAUDE.md first and follow it.
+            Run these checks and keep going until they all pass:
+
+            ${{ steps.checks.outputs.list }}
+            Do not commit, push or open the pull request yourself; leave your changes in the
+            working tree and the workflow does that after you.
+            ${{ inputs.notes }}
+
+            The brief:
+
+            ${{ inputs.instructions }}
+
+      # Codex runs in its workspace sandbox: it may write in the checkout and
+      # run the checks, without network access, and sudo is dropped first so it
+      # cannot read the key from memory.
+      - uses: openai/codex-action@v1
+        if: inputs.engine == 'codex'
+        with:
+          openai-api-key: ${{ secrets.openai_api_key }}
+          sandbox: workspace-write
+          output-file: ${{ runner.temp }}/codex-output.md
+          prompt: |
+            You are implementing work item ${{ inputs.work_item }} ("${{ inputs.title }}")
+            on branch ${{ inputs.branch }} of this repository. Read CLAUDE.md first and follow it:
+            it holds this project's rules, whichever agent reads them.
+            Run these checks and keep going until they all pass:
+
+            ${{ steps.checks.outputs.list }}
+            Do not commit, push or open the pull request yourself; leave your changes in the
+            working tree and the workflow does that after you.
+            ${{ inputs.notes }}
+
+            The brief:
+
+            ${{ inputs.instructions }}
+
+      # The Claude action hides its output for security, including the reason a
+      # run ended in error. Only that final message is printed here: not the
+      # transcript, which can carry the brief and file contents.
+      - name: Report why the coding agent stopped
+        if: failure()
+        run: |
+          claude="${RUNNER_TEMP}/claude-execution-output.json"
+          codex="${RUNNER_TEMP}/codex-output.md"
+          if [ -f "${claude}" ]; then
+            jq -r '[.. | objects | select(.type? == "result")] | last | .result // "No result message."' "${claude}"
+          elif [ -f "${codex}" ]; then
+            tail -n 20 "${codex}"
+          else
+            echo "No output from the coding agent was written."
+          fi
+
+      # Everything since the start, committed by the agent or not. What the
+      # setup built is the repository's .gitignore's business.
+      - name: Package the changes
+        env:
+          START: ${{ steps.start.outputs.sha }}
+        run: |
+          git add -A
+          git diff --cached --binary "${START}" > "${RUNNER_TEMP}/changes.patch"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: provostal-coding-changes
+          path: ${{ runner.temp }}/changes.patch
+          retention-days: 1
+          if-no-files-found: error
+
+  # A fresh runner, which nothing from the first job can have touched. Only here
+  # does the app's write token exist.
+  publish:
+    needs: code
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      # A short-lived token of the GitHub App, scoped to the calling repository
+      # and to what the run needs. Not GITHUB_TOKEN: pushes and pull requests
+      # made with that start no other workflows, so CI would never run on the
+      # result. Not a personal token either: an app is never an admin, so branch
+      # protection binds it. The `github` context is the caller's.
+      - uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ inputs.app_id }}
+          private-key: ${{ secrets.app_private_key }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      # The commit the agent started from, not the branch tip: the patch is
+      # relative to it, and a branch that moved meanwhile makes the push fail as
+      # a non-fast-forward rather than land the patch on a different base.
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.code.outputs.start }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token }}
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: provostal-coding-changes
+          path: ${{ runner.temp }}/changes
+
+      # Inputs reach the shell through the environment, never interpolated into
+      # the script: a title is free text and could carry a command. The patch
+      # is the agent's output and is applied as data: hooks are switched off
+      # for the commit, so nothing in it runs here.
+      - name: Commit, push and open the pull request
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          WORK_ITEM: ${{ inputs.work_item }}
+          TITLE: ${{ inputs.title }}
+          BRANCH: ${{ inputs.branch }}
+          BASE: ${{ inputs.base_branch }}
+        run: |
+          patch="${RUNNER_TEMP}/changes/changes.patch"
+          # Commits in the app's own name, so they show as its bot on GitHub.
+          bot_id="$(gh api "/users/${APP_SLUG}%5Bbot%5D" --jq .id)"
+          git config user.name "${APP_SLUG}[bot]"
+          git config user.email "${bot_id}+${APP_SLUG}[bot]@users.noreply.github.com"
+          if [ -s "${patch}" ]; then
+            git apply --index --binary "${patch}"
+            git -c core.hooksPath=/dev/null commit --no-verify -m "feat: ${WORK_ITEM} ${TITLE}"
+          fi
+          if [ "$(git rev-list --count "origin/${BASE}..HEAD")" = "0" ]; then
+            echo "::error::The coding agent made no changes, so there is nothing to open a pull request for."
+            exit 1
+          fi
+          git push "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${BRANCH}"
+          gh pr view "${BRANCH}" --json number > /dev/null 2>&1 \
+            || gh pr create --base "${BASE}" --head "${BRANCH}" \
+                 --title "${WORK_ITEM}: ${TITLE}" \
+                 --body "Opened by the Provostal coding agent for ${WORK_ITEM}. Review before merging."

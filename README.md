@@ -168,7 +168,15 @@ Makefile target, a script), sits outside `.github/workflows/`. A run can change
 it on its branch, and the next run on that branch executes the changed version
 before its agent starts, with `SETUP_TOKEN` in its environment. Give
 `setup_token` only a read-only credential, scoped as narrowly as the setup
-allows.
+allows, and keep the setup from writing it anywhere the agent can read later:
+not to disk, not to `$GITHUB_ENV`.
+
+Nor is the repository's own CI. The pull request is pushed with the app's token
+precisely so that CI runs on it, and CI then runs the agent's code: its tests,
+its build, its scripts. Treat a coding run's branch the way you would treat a
+pull request from a fork. A CI job that runs the repository's code must not hold
+a secret; a secret belongs only in a step that runs nothing from the branch
+(a `gh api` call, an action pinned elsewhere).
 
 ## Versions
 
